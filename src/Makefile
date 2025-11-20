@@ -28,7 +28,7 @@ ifeq ($(MPI_IBM),1)
 NVCUFLAGS += -DMPI_SUPPORT
 NVLDFLAGS += -lmpi_ibm
 endif
-LIBRARIES += nccl
+LIBRARIES += nccl nvidia-ml uuid
 NVLDFLAGS += $(LIBRARIES:%=-l%)
 
 DST_DIR := $(BUILDDIR)
