@@ -19,8 +19,14 @@
 #include "util.h"
 #include <assert.h>
 #include <errno.h>
+#include <string.h>
+#include <stdio.h>
+#include <nvml.h>
+#include <uuid/uuid.h>
 
 #define PRINT if (is_main_thread) printf
+
+#define MAX_LINE 2048
 
 extern int nThreads;
 extern int nGpus;
@@ -41,7 +47,7 @@ static thread_local bool write_json;
 
 #define JSON_FILE_VERSION 1
 
-#define TIME_STRING_FORMAT "%Y-%m-%d %H:%M:%S"
+#define TIME_STRING_FORMAT "%Y-%m-%d %H:%M:%SZ"
 
 typedef enum {
   JSON_NONE, // A pseudo-state meaning that the document is empty
@@ -274,7 +280,7 @@ static void jsonDouble(const double val) {
 void formatNow(char *buff, int len) {
   time_t now;
   time(&now);
-  struct tm *timeinfo = localtime(&now);
+  struct tm *timeinfo = gmtime(&now);
 
   strftime(buff, len, TIME_STRING_FORMAT, timeinfo);
 }
@@ -342,11 +348,22 @@ void jsonOutputInit(const char *in_path,
   jsonFinishList();
 
   jsonKey("env");
-  jsonStartList();
+  jsonStartObject();
   for(char **e = envp; *e; e++) {
-    jsonStr(*e);
+    char key[MAX_LINE];
+    char value[MAX_LINE];
+    char *ptr;
+    char token = '=';
+    memset(key, 0, MAX_LINE);
+    memset(value, 0, MAX_LINE);
+    ptr = strchr(*e, token);
+    if(ptr != NULL) {
+      strncpy(key, *e, ptr-*e);
+      strncpy(value, ptr+1, MAX_LINE);
+      jsonKey(key); jsonStr(value);
+    }
   }
-  jsonFinishList();
+  jsonFinishObject();
   jsonKey("nccl_version"); jsonInt(test_ncclVersion);
 }
 
@@ -385,6 +402,7 @@ struct rankInfo_t {
   int device;
   char device_hex[128];
   char devinfo[1024];
+  char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
 };
 
 // Helper function to parse the device info lines passed via MPI to the root rank.
@@ -392,7 +410,7 @@ struct rankInfo_t {
 static int parseRankInfo(rankInfo_t *rank, const char *instring) {
   int end;
   sscanf(instring,
-         "#  Rank %d Group %d Pid %d on %1024s device %d [%128[^]]] %1024[^\n]\n%n",
+         "#  Rank %d Group %d Pid %d on %1024s device %d [%128[^]]] %1024[^#]#%30[^\n]\n%n",
          &rank->rank,
          &rank->group,
          &rank->pid,
@@ -400,6 +418,7 @@ static int parseRankInfo(rankInfo_t *rank, const char *instring) {
          &rank->device,
          rank->device_hex,
          rank->devinfo,
+         rank->gpuSerial,
          &end);
   return end;
 }
@@ -413,7 +432,50 @@ static void jsonRankInfo(const rankInfo_t *ri) {
   jsonKey("device");      jsonInt(ri->device);
   jsonKey("device_hex");  jsonStr(ri->device_hex);
   jsonKey("device_info"); jsonStr(ri->devinfo);
+  jsonKey("serial");      jsonStr(ri->gpuSerial);
   jsonFinishObject();
+}
+
+
+int getGPUSerial(int gpuIndex, char *serial) {
+    nvmlReturn_t result;
+    nvmlDevice_t device;
+
+    // Initialize NVML
+    result = nvmlInit();
+    if (NVML_SUCCESS != result) {
+        // Handle error
+        fprintf(stderr, "Failed to initialize NVML: %s\n", nvmlErrorString(result));
+        return 1;
+    }
+
+    // Get device handle for the first GPU (index 0)
+    result = nvmlDeviceGetHandleByIndex(gpuIndex, &device);
+    if (NVML_SUCCESS != result) {
+        // Handle error
+        fprintf(stderr, "Failed to get device handle for index 0: %s\n", nvmlErrorString(result));
+        nvmlShutdown();
+        return 1;
+    }
+
+    // Get the serial number
+    result = nvmlDeviceGetSerial(device, serial, NVML_DEVICE_SERIAL_BUFFER_SIZE);
+    if (NVML_SUCCESS != result) {
+        // Handle error
+        fprintf(stderr, "Failed to get serial number: %s\n", nvmlErrorString(result));
+        nvmlShutdown();
+        return 1;
+    }
+
+    // Shutdown NVML
+    result = nvmlShutdown();
+    if (NVML_SUCCESS != result) {
+        // Handle error
+        fprintf(stderr, "Failed to shutdown NVML: %s\n", nvmlErrorString(result));
+        return 1;
+    }
+
+    return 0;
 }
 
 // Write the start of a benchmark output line containing the bytes &
@@ -544,12 +606,12 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   }
 
   PRINT("# Using devices\n");
-#define MAX_LINE 2048
   char line[MAX_LINE];
   int len = 0;
   const char* envstr = getenv("NCCL_TESTS_DEVICE");
   const int gpu0 = envstr ? atoi(envstr) : -1;
   int available_devices;
+  char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
   CUDACHECK(cudaGetDeviceCount(&available_devices));
   for (int i=0; i<nThreads*nGpus; i++) {
     const int cudaDev = (gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + i;
@@ -562,9 +624,10 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       return testNotImplemented;
     }
     CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
+    getGPUSerial(cudaDev, gpuSerial);
     if (len < MAX_LINE) {
-      len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s\n",
-                      rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name);
+      len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s#%s\n",
+                      rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name, gpuSerial);
     }
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
@@ -646,16 +709,22 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
   PRINT("# Collective test concluded: %s\n", program_name);
 
   if(write_json) {
+    uuid_t binuuid;
+    char *uuid = (char *)malloc(37);
+    uuid_generate_random(binuuid);
+    uuid_unparse(binuuid, uuid);
     jsonKey("out_of_bounds");
     jsonStartObject();
     jsonKey("count");      jsonInt(errors[0]);
     jsonKey("okay");       jsonBool(errors[0] == 0);
     jsonFinishObject();
-    jsonKey("average_bus_bandwidith");
+    jsonKey("average_bus_bandwidth");
     jsonStartObject();
-    jsonKey("bandwidith"); jsonDouble(bw[0]);
+    jsonKey("bandwidth");  jsonDouble(bw[0]);
     jsonKey("okay");       check_avg_bw == -1 ? jsonStr("unchecked") : jsonBool(bw[0] >= check_avg_bw*(0.9));
     jsonFinishObject();
+    jsonKey("collective"); jsonStr(program_name);
+    jsonKey("uuid");       jsonStr(uuid);
   }
 }
 
