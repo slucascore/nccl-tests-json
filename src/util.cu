@@ -355,14 +355,12 @@ void jsonOutputInit(const char *in_path,
   for(char **e = envp; *e; e++) {
     char key[MAX_LINE];
     char value[MAX_LINE];
-    char *ptr;
-    char token = '=';
-    memset(key, 0, MAX_LINE);
-    memset(value, 0, MAX_LINE);
-    ptr = strchr(*e, token);
+    char *ptr = strchr(*e, '=');
     if(ptr != NULL) {
-      strncpy(key, *e, ptr-*e);
-      strncpy(value, ptr+1, MAX_LINE);
+      // snprintf null-terminates; strncpy did not, segfaulting jsonStr on
+      // env values approaching MAX_LINE bytes (e.g. long FPATH/PATH).
+      snprintf(key, sizeof(key), "%.*s", (int)(ptr - *e), *e);
+      snprintf(value, sizeof(value), "%s", ptr + 1);
       jsonKey(key); jsonStr(value);
     }
   }
