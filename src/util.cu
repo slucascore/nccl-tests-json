@@ -353,16 +353,13 @@ void jsonOutputInit(const char *in_path,
   jsonKey("env");
   jsonStartObject();
   for(char **e = envp; *e; e++) {
-    char key[MAX_LINE];
-    char value[MAX_LINE];
     char *ptr = strchr(*e, '=');
-    if(ptr != NULL) {
-      // snprintf null-terminates; strncpy did not, segfaulting jsonStr on
-      // env values approaching MAX_LINE bytes (e.g. long FPATH/PATH).
-      snprintf(key, sizeof(key), "%.*s", (int)(ptr - *e), *e);
-      snprintf(value, sizeof(value), "%s", ptr + 1);
-      jsonKey(key); jsonStr(value);
-    }
+    if(ptr == NULL) continue;
+    // ptr+1 is already a NUL-terminated suffix of *e, so jsonStr reads the
+    // value directly — no intermediate buffer, and no truncation to MAX_LINE.
+    char key[MAX_LINE];
+    snprintf(key, sizeof(key), "%.*s", (int)(ptr - *e), *e);
+    jsonKey(key); jsonStr(ptr + 1);
   }
   jsonFinishObject();
   jsonKey("nccl_version"); jsonInt(test_ncclVersion);
@@ -626,7 +623,11 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       return testNotImplemented;
     }
     CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
-    getGPUSerial(cudaDev, gpuSerial);
+    if (getGPUSerial(cudaDev, gpuSerial) != 0) {
+      // NVML lookup failed — write a defined value rather than emit the
+      // uninitialized/stale buffer into the report (and thus the JSON serial).
+      snprintf(gpuSerial, sizeof(gpuSerial), "unknown");
+    }
     if (len < MAX_LINE) {
       len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s#%s\n",
                       rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name, gpuSerial);
