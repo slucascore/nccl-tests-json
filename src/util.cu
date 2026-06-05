@@ -410,6 +410,10 @@ struct rankInfo_t {
 
 // Helper function to parse the device info lines passed via MPI to the root rank.
 // This fills 'rank' with the parsed contents of 'instring'.
+// The sscanf format below hardcodes the gpuSerial field width (%29); this guards
+// against NVML_DEVICE_SERIAL_BUFFER_SIZE drifting out from under that magic number.
+static_assert(sizeof(rankInfo_t::gpuSerial) == 30,
+              "parseRankInfo assumes that rankInfo_t::gpuSerial has a width of 30 bytes.");
 static int parseRankInfo(rankInfo_t *rank, const char *instring) {
   int end;
   sscanf(instring,
