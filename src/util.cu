@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include <nvml.h>
 #include <uuid/uuid.h>
 
@@ -273,6 +274,10 @@ static void jsonDouble(const double val) {
   if(val != val) {
     fprintf(json_report_fp, "\"nan\"");
   }
+  else if(isinf(val)) {
+    // JSON has no infinity literal; emit a string, matching the "nan" handling above.
+    fprintf(json_report_fp, val < 0 ? "\"-inf\"" : "\"inf\"");
+  }
   else {
     fprintf(json_report_fp, "%lf", val);
   }
@@ -512,6 +517,12 @@ void writeBenchMarkLineNullBody() {
 }
 
 void getFloatStr(double value, int width, char* str) {
+  if (isinf(value)) {
+    // +inf would loop forever below (value >= val always true as val wraps);
+    // short-circuit both signs.
+    sprintf(str, "%*s", width, value < 0 ? "-inf" : "inf");
+    return;
+  }
   int power = 0;
   for (uint64_t val = 1; value >= val; val *= 10) power++;
 
