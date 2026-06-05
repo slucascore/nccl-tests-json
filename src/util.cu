@@ -444,41 +444,23 @@ static void jsonRankInfo(const rankInfo_t *ri) {
 }
 
 
+// Fetch the serial number for one GPU into `serial` (must hold at least
+// NVML_DEVICE_SERIAL_BUFFER_SIZE bytes). NVML must already be initialized by the
+// caller — writeDeviceReport inits/shuts down NVML once around the whole device
+// loop rather than per GPU. Returns 0 on success, nonzero if the handle or serial
+// lookup fails (in which case `serial` is left untouched for the caller to handle).
 int getGPUSerial(int gpuIndex, char *serial) {
-    nvmlReturn_t result;
     nvmlDevice_t device;
 
-    // Initialize NVML
-    result = nvmlInit();
+    nvmlReturn_t result = nvmlDeviceGetHandleByIndex(gpuIndex, &device);
     if (NVML_SUCCESS != result) {
-        // Handle error
-        fprintf(stderr, "Failed to initialize NVML: %s\n", nvmlErrorString(result));
+        fprintf(stderr, "Failed to get device handle for index %d: %s\n", gpuIndex, nvmlErrorString(result));
         return 1;
     }
 
-    // Get device handle for the first GPU (index 0)
-    result = nvmlDeviceGetHandleByIndex(gpuIndex, &device);
-    if (NVML_SUCCESS != result) {
-        // Handle error
-        fprintf(stderr, "Failed to get device handle for index 0: %s\n", nvmlErrorString(result));
-        nvmlShutdown();
-        return 1;
-    }
-
-    // Get the serial number
     result = nvmlDeviceGetSerial(device, serial, NVML_DEVICE_SERIAL_BUFFER_SIZE);
     if (NVML_SUCCESS != result) {
-        // Handle error
-        fprintf(stderr, "Failed to get serial number: %s\n", nvmlErrorString(result));
-        nvmlShutdown();
-        return 1;
-    }
-
-    // Shutdown NVML
-    result = nvmlShutdown();
-    if (NVML_SUCCESS != result) {
-        // Handle error
-        fprintf(stderr, "Failed to shutdown NVML: %s\n", nvmlErrorString(result));
+        fprintf(stderr, "Failed to get serial number for index %d: %s\n", gpuIndex, nvmlErrorString(result));
         return 1;
     }
 
@@ -627,6 +609,14 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   int available_devices;
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
   CUDACHECK(cudaGetDeviceCount(&available_devices));
+
+  // Initialize NVML once for the whole device loop rather than per GPU. A failure
+  // here just means serials are unavailable; the rest of the report still proceeds.
+  const bool nvmlReady = (nvmlInit() == NVML_SUCCESS);
+  if (!nvmlReady) {
+    fprintf(stderr, "Failed to initialize NVML; GPU serials will be reported as \"unknown\".\n");
+  }
+
   for (int i=0; i<nThreads*nGpus; i++) {
     const int cudaDev = (gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + i;
     const int rank = proc*nThreads*nGpus+i;
@@ -635,12 +625,13 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       fprintf(stderr, "Invalid number of GPUs: %d requested but only %d were found.\n",
               (gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + nThreads*nGpus, available_devices);
       fprintf(stderr, "Please check the number of processes and GPUs per process.\n");
+      if (nvmlReady) nvmlShutdown();
       return testNotImplemented;
     }
     CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
-    if (getGPUSerial(cudaDev, gpuSerial) != 0) {
-      // NVML lookup failed — write a defined value rather than emit the
-      // uninitialized/stale buffer into the report (and thus the JSON serial).
+    if (!nvmlReady || getGPUSerial(cudaDev, gpuSerial) != 0) {
+      // NVML unavailable or this device's lookup failed — write a defined value
+      // rather than emit uninitialized/stale bytes into the report (and JSON serial).
       snprintf(gpuSerial, sizeof(gpuSerial), "unknown");
     }
     if (len < MAX_LINE) {
@@ -649,6 +640,13 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     }
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
+
+  // Shut NVML down once, after all serials are gathered. A shutdown failure here
+  // does NOT invalidate the serials already collected, so just log it.
+  if (nvmlReady && nvmlShutdown() != NVML_SUCCESS) {
+    fprintf(stderr, "Failed to shut down NVML.\n");
+  }
+
   if (len >= MAX_LINE) {
     strcpy(line+MAX_LINE-5, "...\n");
   }
