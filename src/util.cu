@@ -713,7 +713,7 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
 
   if(write_json) {
     uuid_t binuuid;
-    char *uuid = (char *)malloc(37);
+    char uuid[37];
     uuid_generate_random(binuuid);
     uuid_unparse(binuuid, uuid);
     jsonKey("out_of_bounds");
