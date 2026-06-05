@@ -411,7 +411,7 @@ struct rankInfo_t {
 static int parseRankInfo(rankInfo_t *rank, const char *instring) {
   int end;
   sscanf(instring,
-         "#  Rank %d Group %d Pid %d on %1024s device %d [%128[^]]] %1024[^#]#%30[^\n]\n%n",
+         "#  Rank %d Group %d Pid %d on %1023s device %d [%127[^]]] %1023[^#]#%29[^\n]\n%n",
          &rank->rank,
          &rank->group,
          &rank->pid,
