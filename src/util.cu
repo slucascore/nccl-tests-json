@@ -628,7 +628,12 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       if (nvmlReady) nvmlShutdown();
       return testNotImplemented;
     }
-    CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
+    // Capture the result first so we can shut NVML down before CUDACHECK's early
+    // return on failure — otherwise this CUDA-error path would leak the NVML
+    // handle initialized above. CUDACHECK just re-reads propErr (no second call).
+    cudaError_t propErr = cudaGetDeviceProperties(&prop, cudaDev);
+    if (propErr != cudaSuccess && nvmlReady) nvmlShutdown();
+    CUDACHECK(propErr);
     if (!nvmlReady || getGPUSerial(cudaDev, gpuSerial) != 0) {
       // NVML unavailable or this device's lookup failed — write a defined value
       // rather than emit uninitialized/stale bytes into the report (and JSON serial).
