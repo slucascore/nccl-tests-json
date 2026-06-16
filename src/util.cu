@@ -359,9 +359,7 @@ void jsonOutputInit(const char *in_path,
   jsonStartObject();
   for(char **e = envp; *e; e++) {
     char *ptr = strchr(*e, '=');
-    if(ptr == NULL) continue;
-    // ptr+1 is already a NUL-terminated suffix of *e, so jsonStr reads the
-    // value directly — no intermediate buffer, and no truncation to MAX_LINE.
+    if(!ptr) continue;
     char key[MAX_LINE];
     snprintf(key, sizeof(key), "%.*s", (int)(ptr - *e), *e);
     jsonKey(key); jsonStr(ptr + 1);
@@ -446,8 +444,7 @@ static void jsonRankInfo(const rankInfo_t *ri) {
 
 // Fetch the serial number for one GPU into `serial` (must hold at least
 // NVML_DEVICE_SERIAL_BUFFER_SIZE bytes). NVML must already be initialized by the
-// caller — writeDeviceReport inits/shuts down NVML once around the whole device
-// loop rather than per GPU. Returns 0 on success, nonzero if the handle or serial
+// caller. Returns 0 on success, nonzero if the handle or serial
 // lookup fails (in which case `serial` is left untouched for the caller to handle).
 int getGPUSerial(int gpuIndex, char *serial) {
     nvmlDevice_t device;
@@ -610,7 +607,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
   CUDACHECK(cudaGetDeviceCount(&available_devices));
 
-  // Initialize NVML once for the whole device loop rather than per GPU. A failure
+  // Initialize NVML once for the whole device loop. A failure
   // here just means serials are unavailable; the rest of the report still proceeds.
   const bool nvmlReady = (nvmlInit() == NVML_SUCCESS);
   if (!nvmlReady) {
