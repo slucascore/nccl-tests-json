@@ -464,6 +464,22 @@ int getGPUSerial(int gpuIndex, char *serial) {
     return 0;
 }
 
+// RAII owner for the NVML library handle. Initializes NVML on construction and
+// guarantees a single shutdown when the scope exits, on any path (normal return,
+// early error return, exception). `ready` reflects whether init succeeded; a
+// failed init means serials are unavailable but the rest of the report proceeds.
+struct NvmlSession {
+  const bool ready;
+  NvmlSession() : ready(nvmlInit() == NVML_SUCCESS) {}
+  ~NvmlSession() {
+    if (ready && nvmlShutdown() != NVML_SUCCESS) {
+      fprintf(stderr, "Failed to shut down NVML.\n");
+    }
+  }
+  NvmlSession(const NvmlSession&) = delete;
+  NvmlSession& operator=(const NvmlSession&) = delete;
+};
+
 // Write the start of a benchmark output line containing the bytes &
 // op type, both to stdout and to json if we are writing there.
 void writeBenchmarkLinePreamble(size_t nBytes, size_t nElem, const char typeName[], const char opName[], int root) {
@@ -607,10 +623,10 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
   CUDACHECK(cudaGetDeviceCount(&available_devices));
 
-  // Initialize NVML once for the whole device loop. A failure
-  // here just means serials are unavailable; the rest of the report still proceeds.
-  const bool nvmlReady = (nvmlInit() == NVML_SUCCESS);
-  if (!nvmlReady) {
+  // Initialize NVML once for the whole device loop; the guard shuts it down on
+  // every exit path from here on (see NvmlSession).
+  NvmlSession nvml;
+  if (!nvml.ready) {
     fprintf(stderr, "Failed to initialize NVML; GPU serials will be reported as \"unknown\".\n");
   }
 
@@ -622,16 +638,10 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       fprintf(stderr, "Invalid number of GPUs: %d requested but only %d were found.\n",
               (gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + nThreads*nGpus, available_devices);
       fprintf(stderr, "Please check the number of processes and GPUs per process.\n");
-      if (nvmlReady) nvmlShutdown();
       return testNotImplemented;
     }
-    // Capture the result first so we can shut NVML down before CUDACHECK's early
-    // return on failure — otherwise this CUDA-error path would leak the NVML
-    // handle initialized above. CUDACHECK just re-reads propErr (no second call).
-    cudaError_t propErr = cudaGetDeviceProperties(&prop, cudaDev);
-    if (propErr != cudaSuccess && nvmlReady) nvmlShutdown();
-    CUDACHECK(propErr);
-    if (!nvmlReady || getGPUSerial(cudaDev, gpuSerial) != 0) {
+    CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
+    if (!nvml.ready || getGPUSerial(cudaDev, gpuSerial) != 0) {
       // NVML unavailable or this device's lookup failed — write a defined value
       // rather than emit uninitialized/stale bytes into the report (and JSON serial).
       snprintf(gpuSerial, sizeof(gpuSerial), "unknown");
@@ -642,12 +652,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     }
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
-
-  // Shut NVML down once, after all serials are gathered. A shutdown failure here
-  // does NOT invalidate the serials already collected, so just log it.
-  if (nvmlReady && nvmlShutdown() != NVML_SUCCESS) {
-    fprintf(stderr, "Failed to shut down NVML.\n");
-  }
+  // NVML is shut down by the NvmlSession guard when this function returns.
 
   if (len >= MAX_LINE) {
     strcpy(line+MAX_LINE-5, "...\n");
