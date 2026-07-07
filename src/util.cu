@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <nvml.h>
-#include <uuid/uuid.h>
+#include <random>
 
 #define PRINT if (is_main_thread) printf
 
@@ -406,15 +406,19 @@ struct rankInfo_t {
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
 };
 
-// Helper function to parse the device info lines passed via MPI to the root rank.
-// This fills 'rank' with the parsed contents of 'instring'.
+// Helper function to parse one device-info line (as gathered to the root rank).
+// This fills 'rank' with the parsed contents at the start of 'instring' and
+// returns the number of bytes consumed, so the caller can advance to the next
+// line and parse again — a single process may report several GPUs, hence
+// several lines, in one buffer. Returns 0 when no complete record is present
+// (end of buffer / trailing garbage), which lets callers loop until exhausted.
 // The sscanf format below hardcodes the gpuSerial field width (%29); this guards
 // against NVML_DEVICE_SERIAL_BUFFER_SIZE drifting out from under that magic number.
 static_assert(sizeof(rankInfo_t::gpuSerial) == 30,
               "parseRankInfo assumes that rankInfo_t::gpuSerial has a width of 30 bytes.");
 static int parseRankInfo(rankInfo_t *rank, const char *instring) {
-  int end;
-  sscanf(instring,
+  int end = 0;
+  const int matched = sscanf(instring,
          "#  Rank %d Group %d Pid %d on %1023s device %d [%127[^]]] %1023[^#]#%29[^\n]\n%n",
          &rank->rank,
          &rank->group,
@@ -425,7 +429,11 @@ static int parseRankInfo(rankInfo_t *rank, const char *instring) {
          rank->devinfo,
          rank->gpuSerial,
          &end);
-  return end;
+  // All 8 fields must be present for a complete record; %n (end) is only
+  // assigned once the scan reaches the trailing newline, i.e. a whole line was
+  // consumed. Anything short of that (end of buffer, "...\n" truncation marker)
+  // yields 0 so the caller's loop terminates.
+  return (matched == 8) ? end : 0;
 }
 
 static void jsonRankInfo(const rankInfo_t *ri) {
@@ -446,22 +454,45 @@ static void jsonRankInfo(const rankInfo_t *ri) {
 // NVML_DEVICE_SERIAL_BUFFER_SIZE bytes). NVML must already be initialized by the
 // caller. Returns 0 on success, nonzero if the handle or serial
 // lookup fails (in which case `serial` is left untouched for the caller to handle).
-int getGPUSerial(int gpuIndex, char *serial) {
+int getGPUSerial(const char *pciBusId, char *serial) {
     nvmlDevice_t device;
 
-    nvmlReturn_t result = nvmlDeviceGetHandleByIndex(gpuIndex, &device);
+    // Look up by PCI bus id, not NVML index: NVML's index space is PCI-ordered and
+    // ignores CUDA_VISIBLE_DEVICES, whereas the caller's cudaDev is a CUDA runtime
+    // ordinal that CUDA_VISIBLE_DEVICES / containers / schedulers remap. Keying by
+    // the stable bus id guarantees the serial matches the GPU this rank actually uses.
+    nvmlReturn_t result = nvmlDeviceGetHandleByPciBusId(pciBusId, &device);
     if (NVML_SUCCESS != result) {
-        fprintf(stderr, "Failed to get device handle for index %d: %s\n", gpuIndex, nvmlErrorString(result));
+        fprintf(stderr, "Failed to get device handle for PCI %s: %s\n", pciBusId, nvmlErrorString(result));
         return 1;
     }
 
     result = nvmlDeviceGetSerial(device, serial, NVML_DEVICE_SERIAL_BUFFER_SIZE);
     if (NVML_SUCCESS != result) {
-        fprintf(stderr, "Failed to get serial number for index %d: %s\n", gpuIndex, nvmlErrorString(result));
+        fprintf(stderr, "Failed to get serial number for PCI %s: %s\n", pciBusId, nvmlErrorString(result));
         return 1;
     }
 
     return 0;
+}
+
+// Generate an RFC-4122 v4 UUID string (36 chars + NUL) without an external libuuid,
+// so building needs no uuid-dev. Randomness is fine for a per-run identifier.
+static void genUuidV4(char out[37]) {
+    std::random_device rd;
+    unsigned char b[16];
+    for (int i = 0; i < 16; i += 4) {
+        unsigned int r = rd();
+        b[i+0] =  r        & 0xFF;
+        b[i+1] = (r >> 8)  & 0xFF;
+        b[i+2] = (r >> 16) & 0xFF;
+        b[i+3] = (r >> 24) & 0xFF;
+    }
+    b[6] = (b[6] & 0x0F) | 0x40;  // version 4
+    b[8] = (b[8] & 0x3F) | 0x80;  // variant 10x
+    snprintf(out, 37,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
 }
 
 // RAII owner for the NVML library handle. Initializes NVML on construction and
@@ -610,7 +641,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     jsonKey("aggregated_iterations"); jsonInt(agg_iters);
     jsonKey("validation");            jsonInt(datacheck);
     jsonKey("graph");                 jsonInt(cudaGraphLaunches);
-    jsonKey("blocking_collectives");  jsonBool(blocking_coll);
+    jsonKey("blocking_collectives");  jsonInt(blocking_coll);
     jsonKey("parallel_init");         jsonBool(parallel_init);
   }
 
@@ -641,7 +672,14 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       return testNotImplemented;
     }
     CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
-    if (!nvml.ready || getGPUSerial(cudaDev, gpuSerial) != 0) {
+    // Resolve the serial by stable PCI bus id (see getGPUSerial): cudaDev is a CUDA
+    // ordinal that CUDA_VISIBLE_DEVICES can remap, so an NVML-by-index lookup could
+    // return another GPU's serial. cudaDeviceGetPCIBusId yields the "dddd:bb:dd.f"
+    // string NVML expects.
+    char pciBusId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE] = {0};
+    if (!nvml.ready
+        || cudaDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), cudaDev) != cudaSuccess
+        || getGPUSerial(pciBusId, gpuSerial) != 0) {
       // NVML unavailable or this device's lookup failed — write a defined value
       // rather than emit uninitialized/stale bytes into the report (and JSON serial).
       snprintf(gpuSerial, sizeof(gpuSerial), "unknown");
@@ -670,9 +708,18 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     for (int p = 0; p < totalProcs; p++) {
       PRINT("%s", lines+MAX_LINE*p);
       if(write_json) {
+        // A process that drives multiple GPUs contributes multiple "# Rank"
+        // lines in its MAX_LINE buffer; walk them all so every GPU's serial is
+        // emitted, not just the first. parseRankInfo returns the bytes consumed
+        // (0 at end-of-buffer); the buffer is NUL-terminated within MAX_LINE, so
+        // the walk cannot run past rank p into rank p+1.
+        const char *cursor = lines + MAX_LINE*p;
         rankInfo_t rankinfo;
-        parseRankInfo(&rankinfo, lines + MAX_LINE*p);
-        jsonRankInfo(&rankinfo);
+        int consumed;
+        while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
+          jsonRankInfo(&rankinfo);
+          cursor += consumed;
+        }
       }
     }
     if(write_json) {
@@ -684,11 +731,18 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
 #else
   PRINT("%s", line);
   if(write_json) {
-    rankInfo_t rankinfo;
-    parseRankInfo(&rankinfo, line);
     jsonKey("devices");
     jsonStartList();
-    jsonRankInfo(&rankinfo);
+    // This process may own several GPUs (nThreads*nGpus > 1), so it wrote one
+    // "# Rank" line per GPU into 'line'. Walk every line so each GPU's serial is
+    // emitted, instead of parsing only the first.
+    const char *cursor = line;
+    rankInfo_t rankinfo;
+    int consumed;
+    while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
+      jsonRankInfo(&rankinfo);
+      cursor += consumed;
+    }
     jsonFinishList();
   }
 #endif
@@ -733,10 +787,8 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
   PRINT("# Collective test concluded: %s\n", program_name);
 
   if(write_json) {
-    uuid_t binuuid;
     char uuid[37];
-    uuid_generate_random(binuuid);
-    uuid_unparse(binuuid, uuid);
+    genUuidV4(uuid);
     jsonKey("out_of_bounds");
     jsonStartObject();
     jsonKey("count");      jsonInt(errors[0]);
