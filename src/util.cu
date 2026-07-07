@@ -406,15 +406,19 @@ struct rankInfo_t {
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
 };
 
-// Helper function to parse the device info lines passed via MPI to the root rank.
-// This fills 'rank' with the parsed contents of 'instring'.
+// Helper function to parse one device-info line (as gathered to the root rank).
+// This fills 'rank' with the parsed contents at the start of 'instring' and
+// returns the number of bytes consumed, so the caller can advance to the next
+// line and parse again — a single process may report several GPUs, hence
+// several lines, in one buffer. Returns 0 when no complete record is present
+// (end of buffer / trailing garbage), which lets callers loop until exhausted.
 // The sscanf format below hardcodes the gpuSerial field width (%29); this guards
 // against NVML_DEVICE_SERIAL_BUFFER_SIZE drifting out from under that magic number.
 static_assert(sizeof(rankInfo_t::gpuSerial) == 30,
               "parseRankInfo assumes that rankInfo_t::gpuSerial has a width of 30 bytes.");
 static int parseRankInfo(rankInfo_t *rank, const char *instring) {
-  int end;
-  sscanf(instring,
+  int end = 0;
+  const int matched = sscanf(instring,
          "#  Rank %d Group %d Pid %d on %1023s device %d [%127[^]]] %1023[^#]#%29[^\n]\n%n",
          &rank->rank,
          &rank->group,
@@ -425,7 +429,11 @@ static int parseRankInfo(rankInfo_t *rank, const char *instring) {
          rank->devinfo,
          rank->gpuSerial,
          &end);
-  return end;
+  // All 8 fields must be present for a complete record; %n (end) is only
+  // assigned once the scan reaches the trailing newline, i.e. a whole line was
+  // consumed. Anything short of that (end of buffer, "...\n" truncation marker)
+  // yields 0 so the caller's loop terminates.
+  return (matched == 8) ? end : 0;
 }
 
 static void jsonRankInfo(const rankInfo_t *ri) {
@@ -670,9 +678,18 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     for (int p = 0; p < totalProcs; p++) {
       PRINT("%s", lines+MAX_LINE*p);
       if(write_json) {
+        // A process that drives multiple GPUs contributes multiple "# Rank"
+        // lines in its MAX_LINE buffer; walk them all so every GPU's serial is
+        // emitted, not just the first. parseRankInfo returns the bytes consumed
+        // (0 at end-of-buffer); the buffer is NUL-terminated within MAX_LINE, so
+        // the walk cannot run past rank p into rank p+1.
+        const char *cursor = lines + MAX_LINE*p;
         rankInfo_t rankinfo;
-        parseRankInfo(&rankinfo, lines + MAX_LINE*p);
-        jsonRankInfo(&rankinfo);
+        int consumed;
+        while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
+          jsonRankInfo(&rankinfo);
+          cursor += consumed;
+        }
       }
     }
     if(write_json) {
@@ -684,11 +701,18 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
 #else
   PRINT("%s", line);
   if(write_json) {
-    rankInfo_t rankinfo;
-    parseRankInfo(&rankinfo, line);
     jsonKey("devices");
     jsonStartList();
-    jsonRankInfo(&rankinfo);
+    // This process may own several GPUs (nThreads*nGpus > 1), so it wrote one
+    // "# Rank" line per GPU into 'line'. Walk every line so each GPU's serial is
+    // emitted, instead of parsing only the first.
+    const char *cursor = line;
+    rankInfo_t rankinfo;
+    int consumed;
+    while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
+      jsonRankInfo(&rankinfo);
+      cursor += consumed;
+    }
     jsonFinishList();
   }
 #endif
