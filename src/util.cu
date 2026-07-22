@@ -88,7 +88,8 @@ static bool sanitizeJson(char out[], int lim, const char *in) {
     case '/':
     case '\t':
     case '\n':
-      if(c + 2 > lim) {
+      // Two escaped bytes plus the terminating NUL must fit.
+      if(c + 2 >= lim) {
         out[c] = 0;
         return false;
       }
@@ -169,7 +170,9 @@ static void jsonKey(const char *name) {
     break;
   }
   char tmp[2048];
-  sanitizeJson(tmp, sizeof(tmp), name);
+  if(!sanitizeJson(tmp, sizeof(tmp), name)) {
+    fprintf(stderr, "JSON key was truncated at %zu bytes or contained unsupported characters.\n", sizeof(tmp)-1);
+  }
   fprintf(json_report_fp, "\"%s\":", tmp);
   jsonPushState(JSON_KEY);
 }
@@ -239,6 +242,24 @@ static void jsonNull() {
   fprintf(json_report_fp, "null");
 }
 
+static void jsonFinishCurrent() {
+  switch(jsonCurrState()) {
+  case JSON_KEY:
+    jsonNull();
+    break;
+  case JSON_OBJECT_EMPTY:
+  case JSON_OBJECT_SOME:
+    jsonFinishObject();
+    break;
+  case JSON_LIST_EMPTY:
+  case JSON_LIST_SOME:
+    jsonFinishList();
+    break;
+  default:
+    assert(0);
+  }
+}
+
 // Write a (sanititzed) string
 static void jsonStr(const char *str) {
   if(str == nullptr) {
@@ -247,7 +268,9 @@ static void jsonStr(const char *str) {
   }
   jsonValHelper();
   char tmp[2048];
-  sanitizeJson(tmp, sizeof(tmp), str);
+  if(!sanitizeJson(tmp, sizeof(tmp), str)) {
+    fprintf(stderr, "JSON string was truncated at %zu bytes or contained unsupported characters.\n", sizeof(tmp)-1);
+  }
   fprintf(json_report_fp, "\"%s\"", tmp);
 }
 
@@ -356,15 +379,11 @@ void jsonOutputInit(const char *in_path,
   jsonFinishList();
 
   jsonKey("env");
-  jsonStartObject();
+  jsonStartList();
   for(char **e = envp; *e; e++) {
-    char *ptr = strchr(*e, '=');
-    if(!ptr) continue;
-    char key[MAX_LINE];
-    snprintf(key, sizeof(key), "%.*s", (int)(ptr - *e), *e);
-    jsonKey(key); jsonStr(ptr + 1);
+    jsonStr(*e);
   }
-  jsonFinishObject();
+  jsonFinishList();
   jsonKey("nccl_version"); jsonInt(test_ncclVersion);
 }
 
@@ -377,12 +396,17 @@ void jsonIdentifyWriter(bool is_writer) {
 void jsonOutputFinalize() {
   if(write_json) {
 
-    jsonKey("end_time");
-    char timebuffer[128];
-    formatNow(timebuffer, sizeof(timebuffer));
-    jsonStr(timebuffer);
+    if(state_n == 1 &&
+       (jsonCurrState() == JSON_OBJECT_EMPTY || jsonCurrState() == JSON_OBJECT_SOME)) {
+      jsonKey("end_time");
+      char timebuffer[128];
+      formatNow(timebuffer, sizeof(timebuffer));
+      jsonStr(timebuffer);
+    }
 
-    jsonFinishObject();
+    while(state_n > 0) {
+      jsonFinishCurrent();
+    }
 
     assert(jsonCurrState() == JSON_NONE);
     free(states);
